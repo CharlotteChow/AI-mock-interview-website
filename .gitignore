@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local IDE/editor settings
+.vscode/
+
+# Local tool state
+.context_memory.json
+.sidebar_settings.json
