@@ -16,7 +16,16 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 APP_TITLE = "AI Oral Interview Practice Agent"
-DEFAULT_CHAT_MODEL = "gpt-4o-mini"
+DEFAULT_CHAT_MODEL = "gpt-5.2-codex"
+YESCODE_PRESET_BASE_URL = "https://co.yes.vg/v1/responses"
+YESCODE_PRESET_MODEL = "gpt-5.2-codex"
+DEFAULT_API_KEY = (os.getenv("OPENAI_API_KEY", "").strip() or os.getenv("YESCODE_API_KEY", "").strip())
+DEFAULT_API_BASE_URL = (os.getenv("OPENAI_BASE_URL", "").strip() or os.getenv("YESCODE_BASE_URL", "").strip())
+DEFAULT_CHAT_MODEL = (
+    os.getenv("OPENAI_MODEL", "").strip()
+    or os.getenv("YESCODE_MODEL", "").strip()
+    or DEFAULT_CHAT_MODEL
+)
 WHISPER_MODEL = "whisper-1"
 LOCAL_WHISPER_MODEL_OPTIONS: Tuple[str, ...] = ("base", "small", "medium")
 LOCAL_WHISPER_MODEL_HINTS: Dict[str, str] = {
@@ -52,6 +61,7 @@ if LOCAL_WHISPER_MODEL not in LOCAL_WHISPER_MODEL_OPTIONS:
     LOCAL_WHISPER_MODEL = "base"
 LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "auto").strip() or "auto"
 LOCAL_WHISPER_COMPUTE_TYPE = os.getenv("LOCAL_WHISPER_COMPUTE_TYPE", "int8").strip() or "int8"
+DEFAULT_GATEWAY_AUTH_MODE = "both"
 
 
 @dataclass(frozen=True)
@@ -142,13 +152,28 @@ def _is_invalid_client_error(exc: Exception) -> bool:
     return "403" in msg and ("invalid client" in msg or "invalid_client" in msg)
 
 
+def _is_invalid_client_message(msg: str) -> bool:
+    t = (msg or "").lower()
+    return "403" in t and ("invalid client" in t or "invalid_client" in t)
+
+
 def _normalize_base_url(base_url: str) -> str:
     base_url = (base_url or "").strip()
     if not base_url:
         return ""
-    normalized = base_url.rstrip("/")
-    if not normalized.endswith("/v1"):
-        return normalized + "/v1"
+    # Keep provider URL exactly as entered (except trailing slash trim),
+    # because some OpenAI-compatible gateways do not expose /v1.
+    return base_url.rstrip("/")
+
+
+def _is_responses_endpoint_url(base_url: str) -> bool:
+    return _normalize_base_url(base_url).lower().endswith("/responses")
+
+
+def _client_base_url_for_openai_sdk(base_url: str) -> str:
+    normalized = _normalize_base_url(base_url)
+    if normalized.lower().endswith("/responses"):
+        return normalized[: -len("/responses")]
     return normalized
 
 
@@ -169,6 +194,20 @@ def _mark_current_credentials_invalid() -> None:
     )
     if fp:
         ss["api_invalid_fingerprint"] = fp
+
+
+def _probe_api_connection(client, *, model: str) -> Tuple[bool, str]:
+    try:
+        content = _call_chat_text(
+            client,
+            model=(model or DEFAULT_CHAT_MODEL).strip() or DEFAULT_CHAT_MODEL,
+            system_prompt="You are a connectivity test assistant. Keep responses brief.",
+            user_prompt="Reply with exactly: OK",
+            temperature=0.0,
+        )
+        return True, content.strip()[:120] or "OK"
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _explain_looks_invalid(explain: Any) -> bool:
@@ -741,19 +780,32 @@ def _extract_resume_texts(uploaded_files: List[Any]) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _get_openai_client(api_key: str, *, base_url: str = ""):
+def _get_openai_client(api_key: str, *, base_url: str = "", gateway_auth_mode: str = "authorization"):
     api_key = (api_key or "").strip()
     if not api_key:
         return None
     base_url = (base_url or "").strip()
+    force_responses_api = _is_responses_endpoint_url(base_url)
+    client_base_url = _client_base_url_for_openai_sdk(base_url)
+    auth_mode = (gateway_auth_mode or "authorization").strip().lower()
+    if auth_mode not in {"authorization", "both"}:
+        auth_mode = "authorization"
     try:
         from openai import OpenAI  # type: ignore
     except Exception as exc:  # pragma: no cover
         st.sidebar.warning(f"OpenAI SDK not available; using mock mode. ({exc})")
         return None
-    if base_url:
-        return OpenAI(api_key=api_key, base_url=base_url)
-    return OpenAI(api_key=api_key)
+    if client_base_url:
+        default_headers: Dict[str, str] = {}
+        if auth_mode == "both":
+            # Some OpenAI-compatible gateways require X-API-Key in addition to Authorization.
+            default_headers["X-API-Key"] = api_key
+        client = OpenAI(api_key=api_key, base_url=client_base_url, default_headers=default_headers or None)
+    else:
+        client = OpenAI(api_key=api_key)
+    if force_responses_api:
+        setattr(client, "_force_responses_api", True)
+    return client
 
 
 def _mock_questions(resume_text: str, jd_text: str, n: int) -> List[str]:
@@ -790,7 +842,17 @@ def _call_chat_text(
         raise RuntimeError("No OpenAI client configured")
 
     resp = None
-    if hasattr(client, "chat") and hasattr(getattr(client, "chat"), "completions"):
+    force_responses_api = bool(getattr(client, "_force_responses_api", False))
+    if force_responses_api and hasattr(client, "responses"):
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=temperature,
+        )
+    elif hasattr(client, "chat") and hasattr(getattr(client, "chat"), "completions"):
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -1746,7 +1808,7 @@ def _init_session_state() -> None:
     ss.setdefault("questions_per_section", 5)
     ss.setdefault("time_limit_label", "60s")
     ss.setdefault("jd_text_input", "")
-    ss.setdefault("api_base_url", os.getenv("OPENAI_BASE_URL", ""))
+    ss.setdefault("api_base_url", DEFAULT_API_BASE_URL)
     ss.setdefault("timer_question_idx", None)
     ss.setdefault("timer_started_at", None)
     ss.setdefault("question_explain", {})  # idx -> dict
@@ -1878,19 +1940,52 @@ def _render_sidebar() -> Tuple[Optional[Any], str, str]:
         st.sidebar.caption(mem_msg)
         st.session_state["context_memory_last_action"] = ""
 
+    # Apply deferred updates before widgets are instantiated in this rerun.
+    pending_sidebar_updates = st.session_state.pop("_pending_sidebar_updates", None)
+    if isinstance(pending_sidebar_updates, dict):
+        for k, v in pending_sidebar_updates.items():
+            st.session_state[k] = v
+
+    pending_settings_load = st.session_state.pop("_pending_sidebar_settings_load", None)
+    if isinstance(pending_settings_load, dict):
+        _apply_sidebar_settings_to_session(pending_settings_load)
+
     api_key = st.sidebar.text_input(
         "OpenAI API Key",
         type="password",
-        value=os.getenv("OPENAI_API_KEY", ""),
+        value=DEFAULT_API_KEY,
         key="openai_api_key_input",
-        help="Leave blank to use Mock Mode (UI works without API calls).",
+        help="Leave blank to use Mock Mode. Also supports YESCODE_API_KEY env. For third-party gateways, this key is auto-sent as X-API-Key.",
     )
     base_url = st.sidebar.text_input(
         "API Base URL (optional)",
         key="api_base_url",
-        help="Use this for OpenAI-compatible providers (leave blank for OpenAI).",
+        help="Use this for OpenAI-compatible providers (leave blank for OpenAI). Also supports OPENAI_BASE_URL / YESCODE_BASE_URL env.",
     )
     base_url = _normalize_base_url(base_url)
+
+    col_provider1, col_provider2 = st.sidebar.columns(2)
+    use_third_party_api = col_provider1.button(
+        "Use Third-Party API",
+        use_container_width=True,
+        help=f"Set Base URL to {YESCODE_PRESET_BASE_URL} and model to {YESCODE_PRESET_MODEL}.",
+    )
+    use_openai = col_provider2.button(
+        "Use OpenAI Default",
+        use_container_width=True,
+        help="Clear Base URL and keep model editable manually.",
+    )
+    if use_third_party_api:
+        st.session_state["_pending_sidebar_updates"] = {
+            "api_base_url": YESCODE_PRESET_BASE_URL,
+            "chat_model": os.getenv("YESCODE_MODEL", "").strip() or YESCODE_PRESET_MODEL,
+        }
+        st.session_state["sidebar_settings_last_action"] = "Applied third-party API preset."
+        st.rerun()
+    if use_openai:
+        st.session_state["_pending_sidebar_updates"] = {"api_base_url": ""}
+        st.session_state["sidebar_settings_last_action"] = "Switched to OpenAI default base URL."
+        st.rerun()
 
     ss = st.session_state
     current_fp = _api_credential_fingerprint(api_key, base_url)
@@ -1909,7 +2004,11 @@ def _render_sidebar() -> Tuple[Optional[Any], str, str]:
             "Using Mock Mode until credentials change."
         )
     else:
-        client = _get_openai_client(api_key, base_url=base_url)
+        client = _get_openai_client(
+            api_key,
+            base_url=base_url,
+            gateway_auth_mode=DEFAULT_GATEWAY_AUTH_MODE,
+        )
         if client is None and api_key.strip():
             mode_reason = "API 客户端初始化失败（请检查 SDK / Base URL / Key）"
 
@@ -1927,6 +2026,52 @@ def _render_sidebar() -> Tuple[Optional[Any], str, str]:
     else:
         detail = f"（{mode_reason}）" if mode_reason else ""
         st.sidebar.warning(f"Current Mode: Mock{detail}")
+
+    if base_url:
+        st.sidebar.caption(f"Base URL in use: {base_url}")
+    else:
+        st.sidebar.caption("Base URL in use: OpenAI default")
+
+    col_mo1, col_mo2 = st.sidebar.columns(2)
+    retry_api = col_mo1.button(
+        "Retry API",
+        use_container_width=True,
+        disabled=not api_key.strip(),
+        help="Clear the cached 403 marker and retry current credentials.",
+    )
+    test_api = col_mo2.button(
+        "Test API",
+        use_container_width=True,
+        disabled=not api_key.strip(),
+        help="Send a tiny test request with current key/base URL/model.",
+    )
+
+    if retry_api:
+        st.session_state["api_invalid_fingerprint"] = ""
+        st.session_state["sidebar_settings_last_action"] = "Cleared cached 403 marker. Please click Start Interview Section again."
+        st.rerun()
+
+    if test_api:
+        probe_client = _get_openai_client(
+            api_key,
+            base_url=base_url,
+            gateway_auth_mode=DEFAULT_GATEWAY_AUTH_MODE,
+        )
+        if probe_client is None:
+            st.sidebar.error("Could not initialize API client with current settings.")
+        else:
+            with st.spinner("Testing API connectivity..."):
+                ok, detail = _probe_api_connection(
+                    probe_client,
+                    model=str(st.session_state.get("chat_model") or DEFAULT_CHAT_MODEL).strip(),
+                )
+            if ok:
+                st.session_state["api_invalid_fingerprint"] = ""
+                st.sidebar.success(f"API test passed. Provider replied: {detail}")
+            else:
+                if _is_invalid_client_message(detail):
+                    _mark_current_credentials_invalid()
+                st.sidebar.error(f"API test failed: {detail}")
 
     uploaded_resumes = st.sidebar.file_uploader(
         "Upload Resume(s) (PDF or TXT)",
@@ -2016,7 +2161,7 @@ def _render_sidebar() -> Tuple[Optional[Any], str, str]:
         if not data:
             st.sidebar.warning("No saved settings found.")
         else:
-            _apply_sidebar_settings_to_session(data)
+            st.session_state["_pending_sidebar_settings_load"] = data
             st.session_state["sidebar_settings_last_action"] = "Loaded saved settings."
             st.rerun()
 

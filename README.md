@@ -40,6 +40,13 @@ streamlit run app.py
 5. 每题点击 **Start Answer** 开始计时，录音后点击 **Submit & Analyze**。
 6. 查看反馈后点 **Next Question**，最后进入 **Section Review** 总结页（包含 transcript 改写版 + 按时长生成的完美回答）。
 
+### Third-Party API 快速接入
+
+- 左侧点击 **Use Third-Party API**，会自动填入：
+  - Base URL: `https://co.yes.vg/v1/responses`
+  - Model: `gpt-5.2-codex`
+- 再填入你的 YesCode Key 即可（也支持环境变量 `YESCODE_API_KEY`）。
+
 ## 两种运行模式
 
 ### Online 模式（有 API Key）
@@ -63,6 +70,12 @@ streamlit run app.py
 ```bash
 export OPENAI_API_KEY="..."
 export OPENAI_BASE_URL="https://your-provider.com/v1"
+export OPENAI_MODEL="gpt-4o-mini"
+
+# YesCode（可二选一或混用 OpenAI 变量）
+export YESCODE_API_KEY="..."
+export YESCODE_BASE_URL="https://co.yes.vg/v1/responses"
+export YESCODE_MODEL="gpt-5.2-codex"
 
 # 本地 faster-whisper 参数（可选）
 export LOCAL_WHISPER_MODEL="base"
@@ -72,7 +85,9 @@ export LOCAL_WHISPER_COMPUTE_TYPE="int8"
 
 说明：
 - `OPENAI_BASE_URL` 适用于 OpenAI 兼容服务。
-- 若 Base URL 没有以 `/v1` 结尾，应用会自动补上。
+- 未设置 `OPENAI_*` 时，会自动读取 `YESCODE_*` 变量作为默认值。
+- Base URL 不会再自动补 `/v1`，请按你的服务商文档填写完整地址。
+- 使用第三方 Base URL 时，应用会自动把同一个 Key 也作为 `X-API-Key` 请求头发送。
 
 ## 本地持久化文件
 
